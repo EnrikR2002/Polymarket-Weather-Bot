@@ -19,6 +19,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("US/Eastern")
 
 import aiohttp
 import discord
@@ -562,6 +565,13 @@ class SyferBot(discord.Client):
     async def on_ready(self):
         self.channel = self.get_channel(CHANNEL_ID)
         log.info(f"SYFER bot online as {self.user} — channel: {self.channel}")
+        # Restore today's pending reactions from disk so reactions survive restarts
+        data = load_data()
+        today = datetime.now(ET).date().isoformat()
+        for sig in data.get("signals", []):
+            if sig.get("signal_date") == today and sig.get("message_id"):
+                self.pending_reactions[int(sig["message_id"])] = sig
+        log.info(f"Restored {len(self.pending_reactions)} pending reactions from disk")
         if self.channel:
             await self.channel.send(embed=discord.Embed(
                 title="🌤️ SYFER WEATHER BOT ONLINE",
@@ -569,21 +579,39 @@ class SyferBot(discord.Client):
                 color=0x00d4ff
             ))
 
-    async def on_reaction_add(self, reaction, user):
-        if user.bot: return
-        msg_id = reaction.message.id
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.user_id == self.user.id: return
+        msg_id = payload.message_id
         if msg_id not in self.pending_reactions: return
 
         sig = self.pending_reactions[msg_id]
-        emoji = str(reaction.emoji)
+        emoji = str(payload.emoji)
 
         if emoji == "✅":
-            # Mark as traded — will be resolved at 8 PM
             sig["traded"] = True
+            # Persist to disk so evening resolution sees it
+            data = load_data()
+            for s in data.get("signals", []):
+                if s.get("message_id") == msg_id:
+                    s["traded"] = True
+                    break
+            save_data(data)
             log.info(f"Signal marked as TRADED: {sig['city']} {sig['grade']}")
-            await reaction.message.add_reaction("📝")
+            channel = self.get_channel(payload.channel_id)
+            if channel:
+                try:
+                    message = await channel.fetch_message(msg_id)
+                    await message.add_reaction("📝")
+                except Exception as e:
+                    log.warning(f"Could not add 📝 reaction: {e}")
         elif emoji == "❌":
             sig["traded"] = False
+            data = load_data()
+            for s in data.get("signals", []):
+                if s.get("message_id") == msg_id:
+                    s["traded"] = False
+                    break
+            save_data(data)
             log.info(f"Signal skipped: {sig['city']} {sig['grade']}")
 
     # ── MORNING JOB ──────────────────────────────────────────
@@ -648,7 +676,7 @@ class SyferBot(discord.Client):
             await msg.add_reaction("✅")
             await msg.add_reaction("❌")
             # Store with today's date as key for evening resolution
-            sig["signal_date"] = datetime.now(timezone.utc).date().isoformat()
+            sig["signal_date"] = datetime.now(ET).date().isoformat()
             sig["traded"] = False
             sig["message_id"] = msg.id
             self.pending_reactions[msg.id] = sig
@@ -656,7 +684,7 @@ class SyferBot(discord.Client):
 
         # Save signals to disk
         data = load_data()
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(ET).date().isoformat()
         data["signals"] = [s for s in data.get("signals", []) if s.get("signal_date") != today]
         data["signals"].extend([s for s in tradeable[:6]])
         save_data(data)
@@ -669,7 +697,7 @@ class SyferBot(discord.Client):
             self.channel = self.get_channel(CHANNEL_ID)
 
         data = load_data()
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(ET).date().isoformat()
         today_sigs = [s for s in data.get("signals", []) if s.get("signal_date") == today]
 
         if not today_sigs:
